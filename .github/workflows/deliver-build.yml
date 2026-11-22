@@ -1,7 +1,8 @@
 name: deliver-build
 
-# One-off: copies the Windows app from a finished windows run onto the
-# build-output branch, so it can be fetched with plain git.
+# One-off: unpacks the Windows installer from a finished windows run (plus the
+# official v0.5.20 app as a backup) and publishes it on the build-output
+# branch as an archive, so it can be fetched with plain git.
 on:
   push:
     branches: [deliver-build]
@@ -16,19 +17,39 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: windows-app
+          name: windows-installer
           run-id: 45054593750
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: app
-      - name: Push the app to build-output
+          path: inst
+      - name: Unpack the installer
+        run: |
+          ls -la inst
+          7z x -y -oapp inst/*.exe > /dev/null
+          rm -rf 'app/$PLUGINSDIR' app/uninstall.exe.nsis
+          ls -la app
+          du -sh app/*
+      - name: Official v0.5.20 app as the backup original
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cd app
-          ls -la
+          gh release download v0.5.20 -R pobredux/pob-redux -p '*.exe' -D orig
+          ls -la orig
+          7z x -y -oorigx orig/*.exe pob-redux.exe > /dev/null
+          cp origx/pob-redux.exe app/pob-redux.original.exe
+          ls -la app/*.exe
+      - name: Push the archive to build-output
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir out
+          tar czf out/restore.tar.gz -C app .
+          (cd out && split -b 90m -d restore.tar.gz restore.tar.gz.part && rm restore.tar.gz && sha256sum restore.tar.gz.part* > SHA256SUMS)
+          ls -la out
+          cd out
           git init -q -b build-output
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pob-redux.exe
-          git commit -q -m "Windows build of feat/calcs-damage-flow (run 45054593750)"
+          git add .
+          git commit -q -m "Unpacked Windows installer of feat/calcs-damage-flow (run 45054593750)"
           git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" build-output
