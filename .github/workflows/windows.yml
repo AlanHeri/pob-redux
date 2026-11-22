@@ -117,10 +117,17 @@ jobs:
           fi
 
       - name: Build the app
+        shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: bun run tauri build --no-bundle
+        run: |
+          # Forks lack the updater key: build without updater artifacts rather than fail.
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set; skipping updater artifacts"
+            set -- --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          fi
+          bun run tauri build --no-bundle "$@"
 
       # The updater reads this marker; Tauri writes it while bundling, after signing, which would break the signature.
       - name: Mark the app as an NSIS install
@@ -165,10 +172,25 @@ jobs:
         run: cp signed/app/pob-redux.exe target/release/pob-redux.exe
 
       - name: Build the installer
+        shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: bun run tauri bundle --bundles nsis --no-binary-patching
+        run: |
+          # Forks lack the updater key: build without updater artifacts rather than fail.
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set; skipping updater artifacts"
+            set -- --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          fi
+          bun run tauri bundle --bundles nsis --no-binary-patching "$@"
+
+      - name: Keep the app executable as a workflow artifact
+        if: ${{ !inputs.upload }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-app
+          path: target/release/pob-redux.exe
+          if-no-files-found: error
 
       - name: Name the installer as the release does
         shell: bash
@@ -231,7 +253,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           VERSION: ${{ steps.version.outputs.version }}
           INSTALLER: ${{ steps.version.outputs.installer }}
-        run: bun run tauri signer sign --app-version "$VERSION" "$INSTALLER"
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set; the installer has no updater signature"
+            exit 0
+          fi
+          bun run tauri signer sign --app-version "$VERSION" "$INSTALLER"
 
       - name: Upload to the draft release
         if: inputs.upload
