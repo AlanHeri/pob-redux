@@ -1,0 +1,34 @@
+name: deliver-build
+
+# One-off: copies the Windows app from a finished windows run onto the
+# build-output branch, so it can be fetched with plain git.
+on:
+  push:
+    branches: [deliver-build]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-app
+          run-id: 45054593750
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: app
+      - name: Push the app to build-output
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd app
+          ls -la
+          git init -q -b build-output
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pob-redux.exe
+          git commit -q -m "Windows build of feat/calcs-damage-flow (run 45054593750)"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" build-output
