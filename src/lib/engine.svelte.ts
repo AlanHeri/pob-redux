@@ -611,6 +611,89 @@ export interface CalcSection {
   subSections: CalcSubSection[];
 }
 
+export type DamageType = "Physical" | "Lightning" | "Cold" | "Fire" | "Chaos";
+export interface DamageRange {
+  min: number;
+  max: number;
+  avg: number;
+}
+export type DamageByType = Record<DamageType, DamageRange>;
+export interface DamageFlowSource {
+  source: string;
+  value: number;
+  mods: string[];
+}
+export interface DamageFlowLink {
+  from: DamageType;
+  to: DamageType;
+  pct: number;
+  amount: number;
+}
+export interface DamageFlowWeapon {
+  name: string;
+  baseName: string | null;
+  quality: number;
+  base: DamageByType;
+  final: DamageByType;
+  localLines: string[];
+}
+export interface DamageFlowEnemy {
+  type: DamageType;
+  mitigationMult: number;
+  effectiveResist: number;
+  takenInc: number;
+  takenMore: number;
+  takenMult: number;
+  takenIncSources: DamageFlowSource[];
+  takenMoreSources: DamageFlowSource[];
+  effMult: number | null;
+  armour?: number;
+  physicalReduction?: number;
+  resist?: number;
+  resistOverride?: number | null;
+  resistSources?: DamageFlowSource[];
+  penetration?: number;
+  penetrationSources?: DamageFlowSource[];
+}
+/** One step of PoE2's hit pipeline; `values` is the damage by type after the step. */
+export interface DamageFlowStep {
+  id: "source" | "added" | "convSkill" | "convGlobal" | "gain" | "increased" | "more" | "other" | "crit" | "mitigation" | "taken";
+  values: DamageByType;
+  weapon?: DamageFlowWeapon | null;
+  added?: DamageByType;
+  addedMult?: Record<DamageType, number>;
+  baseMultiplier?: number;
+  sources?: DamageFlowSource[];
+  flows?: DamageFlowLink[];
+  table?: Record<DamageType, Record<DamageType | "kept", number>>;
+  factor?: Record<DamageType, number>;
+  sourcesByType?: Record<DamageType, DamageFlowSource[]>;
+  allMult?: number;
+  doubleChance?: number;
+  tripleChance?: number;
+  critChance?: number;
+  critMultiplier?: number;
+  critAvgMult?: number;
+  enemy?: Record<DamageType, DamageFlowEnemy>;
+}
+export type DamageFlow =
+  | { supported: false; reason: string; skill?: string; rev: number }
+  | {
+      supported: true;
+      rev: number;
+      skill: string;
+      isAttack: boolean;
+      pass: string;
+      types: DamageType[];
+      steps: DamageFlowStep[];
+      averageHit: number;
+      pobAverageHit: number | null;
+      hitChance: number | null;
+      averageDamage: number | null;
+      critChance: number;
+      critMultiplier: number;
+    };
+
 export interface CalcSkillSelection {
   group: number | null;
   groups: { index: number; label: string }[];
@@ -1827,6 +1910,8 @@ export const engine = {
   calcSkill: (patch?: { group?: number; activeSkill?: number }) => call<CalcSkillSelection>("calc_skill", patch ?? {}),
   calcCellBreakdown: (ref: { section: number; sub: number; row: number; col: number; actor?: string }) =>
     call<{ sections: BreakdownSection[]; rev: number }>("calc_cell_breakdown", ref),
+  /** PoE2 hit pipeline for the Calcs skill, step by step (the Calcs "Damage flow" card). */
+  damageFlow: () => call<DamageFlow>("damage_flow"),
   configVisibility: () => call<{ visibility: Record<string, boolean>; rev: number }>("config_visibility"),
   getStats: (fields?: string[]) => call<{ stats: Record<string, number | string | boolean>; rev: number }>("get_stats", fields ? { fields } : undefined),
   setLevel: (level: number) => call<BuildInfo>("set_level", { level }),

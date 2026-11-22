@@ -15,6 +15,7 @@
   import Icon from "$lib/components/Icon.svelte";
   import PobText from "$lib/components/PobText.svelte";
   import CalcBreakdownWindows from "$lib/components/CalcBreakdownWindows.svelte";
+  import DamageFlow from "$lib/components/DamageFlow.svelte";
   import { stripPobText } from "$lib/pobtext";
   import { calcLabel } from "$lib/pob-labels";
   import { calcBreakdownKey, type CalcBreakdownRef } from "$lib/calc-breakdown";
@@ -56,7 +57,7 @@
   } catch {}
 
   function sectionIsOpen(section: CalcSection) {
-    return sectionOpenOverrides[section.id] ?? sectionIsRelevant(section);
+    return sectionOpenOverrides[section.id] ?? (section.id === FLOW_ID || sectionIsRelevant(section));
   }
 
   function toggleSection(section: CalcSection) {
@@ -191,6 +192,36 @@
     });
   }
 
+  // The Damage Flow card is ours, not one of PoB's sections: it joins the
+  // offence band as a synthetic section so it sorts, folds and drags like the rest.
+  const FLOW_ID = "DamageFlow";
+  const flowSection = $derived<CalcSection>({
+    index: -1,
+    id: FLOW_ID,
+    group: 1,
+    colour: null,
+    enabled: true,
+    subSections: [{ index: 1, label: m.calcs_flow_title(), extra: null, colWidth: null, rows: [] }],
+  });
+  const showFlow = $derived(game.current === "poe2" && actor === "player" && (!needle || hit(m.calcs_flow_title()) || hit("damage flow")));
+
+  /** Right under Skill Hit Damage, unless the user has dragged it somewhere. */
+  function placeFlow(sections: CalcSection[]) {
+    if (!showFlow) return sections;
+    if (calcsOrder.offence.keys.includes(FLOW_ID)) return calcsOrder.offence.sort([...sections, flowSection], (sec) => sec.id);
+    const out = [...sections];
+    const at = out.findIndex((sec) => sec.id === "HitDamage");
+    out.splice(at < 0 ? 0 : at + 1, 0, flowSection);
+    return out;
+  }
+
+  /** Skill Hit Damage and the Damage Flow card under it share the same left columns. */
+  function flowFollowsHit(list: CalcSection[], sec: CalcSection, index: number) {
+    if (sec.id === "HitDamage") return list[index + 1]?.id === FLOW_ID;
+    if (sec.id === FLOW_ID) return list[index - 1]?.id === "HitDamage";
+    return false;
+  }
+
   const sectionBands = $derived.by(() => {
     const visible = sections.filter(
       (section) => section.enabled && section.subSections.some(subsectionHasContent) && (!needle || section.subSections.some((sub) => subHit(section, sub))),
@@ -209,7 +240,10 @@
       { id: "defence", label: m.calcs_group_defence(), sections: defence },
       { id: "other", label: m.calcs_group_other(), sections: other },
     ]
-      .map((band) => ({ ...band, sections: calcsOrder[band.id].sort(band.sections, (s) => s.id) }))
+      .map((band) => {
+        const sorted = calcsOrder[band.id].sort(band.sections, (s) => s.id);
+        return { ...band, sections: band.id === "offence" ? placeFlow(sorted) : sorted };
+      })
       .filter((band) => band.sections.length > 0);
   });
 
@@ -491,8 +525,9 @@
               {#if calcsOrder[band.id].changed}<button class="reset" onclick={() => calcsOrder[band.id].reset()}>{m.common_reset_order()}</button>{/if}
             </div>
             <div class="sectiongrid" bind:this={gridEls[band.id]}>
-              {#each band.sections as sec (sec.id)}
-              {@const table = sec.subSections.some((s) => s.rows.some((r) => r.cells.length >= 4))}
+              {#each band.sections as sec, secIndex (sec.id)}
+              {@const pinLeft = flowFollowsHit(band.sections, sec, secIndex)}
+              {@const table = sec.id === FLOW_ID || sec.subSections.some((s) => s.rows.some((r) => r.cells.length >= 4))}
               {@const head = sec.subSections[0]!}
               {@const open = needle !== "" || sectionIsOpen(sec)}
               {@const damageHeroes = damageTakenHeroes(sec).filter((hero) => !needle || sectionHit(sec) || hit(hero.label))}
@@ -500,7 +535,7 @@
                 (sub) => subsectionHasContent(sub) && !isPromotedDamageTakenSubsection(sec, sub.label) && (!needle || subHit(sec, sub)),
               )}
               {@const headerExtra = cardHeaderExtra(sec, head.extra ?? null)}
-                <section class="section" class:table class:dragging={sorting === sec.id} data-sort={sec.id} use:masonryCard animate:flip={{ duration: sorting === sec.id ? 0 : 200 }}>
+                <section class="section" class:table class:pin-left={pinLeft} class:dragging={sorting === sec.id} data-sort={sec.id} use:masonryCard animate:flip={{ duration: sorting === sec.id ? 0 : 200 }}>
                 {#snippet extraText()}<span class="num"><PobText text={headerExtra} /></span>{/snippet}
                 <CardHead
                   {open}
@@ -512,7 +547,11 @@
                 >
                   {#snippet name()}<PobText text={calcLabel(head.label)} />{/snippet}
                 </CardHead>
-                {#if open}
+                {#if open && sec.id === FLOW_ID}
+                  <div class="cardbody">
+                    <DamageFlow />
+                  </div>
+                {:else if open}
                   <div class="cardbody">
                     {#if sec.id === "HitDamage"}
                       <div class="hit-heroes">
@@ -846,8 +885,12 @@
   .section.table {
     grid-column: span 2;
   }
+  .section.table.pin-left {
+    grid-column: 1 / span 2;
+  }
   @container (width < 720px) {
-    .section.table {
+    .section.table,
+    .section.table.pin-left {
       grid-column: auto;
     }
   }

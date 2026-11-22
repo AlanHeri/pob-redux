@@ -1475,6 +1475,460 @@ M.calc_cell_breakdown = function(p)
 	return { sections = sections, rev = build.outputRevision }
 end
 
+-- Damage flow for the Calcs "Damage Flow" card: PoE2's hit pipeline for the
+-- Calcs skill, step by step, read from the live CALCS env so every number is
+-- PoB's own. Steps: weapon/skill base -> added x effectiveness -> skill
+-- conversion -> global conversion -> gain as extra -> increased -> more ->
+-- other multipliers -> crit -> enemy mitigation -> damage taken.
+local DF_TYPES = { "Physical", "Lightning", "Cold", "Fire", "Chaos" }
+local DF_ELEMENTAL = { Fire = true, Cold = true, Lightning = true }
+
+local function dfSourceName(src)
+	src = tostring(src or "")
+	local item = src:match("^Item:%d+:(.+)$") or src:match("^Party %- (.+)$")
+	if item then return item end
+	local nodeId = tonumber(src:match("^Tree:(%d+)$"))
+	if nodeId then
+		local node = build.spec and build.spec.tree.nodes[nodeId]
+		return node and node.dn or "Passive skill"
+	end
+	local skillId = src:match("^Skill:(.+)$")
+	if skillId then return data.skills[skillId] and data.skills[skillId].name or skillId end
+	if src == "" then return "Other" end
+	if src == "EnemyConfig" or src == "Config" then return "Configuration" end
+	return src
+end
+
+-- Group a Tabulate() list by readable source: INC/BASE sum, MORE multiply.
+local function dfSources(list, kind)
+	local bySource, order = {}, {}
+	for _, entry in ipairs(list or {}) do
+		local mod = entry.mod
+		local value = entry.value
+		if type(value) == "number" and value ~= 0 then
+			local name = dfSourceName(mod and mod.source)
+			local acc = bySource[name]
+			if not acc then
+				acc = { source = name, value = kind == "MORE" and 1 or 0, mods = {} }
+				bySource[name] = acc
+				order[#order + 1] = acc
+			end
+			if kind == "MORE" then acc.value = acc.value * (1 + value / 100) else acc.value = acc.value + value end
+			acc.mods[mod and mod.name or "?"] = true
+		end
+	end
+	local out = array({})
+	for _, acc in ipairs(order) do
+		local mods = array({})
+		for name in pairs(acc.mods) do mods[#mods + 1] = name end
+		table.sort(mods)
+		local value = kind == "MORE" and (acc.value - 1) * 100 or acc.value
+		if math.abs(value) > 1e-9 then
+			out[#out + 1] = { source = acc.source, value = value, mods = mods }
+		end
+	end
+	table.sort(out, function(a, b) return math.abs(a.value) > math.abs(b.value) end)
+	return out
+end
+
+-- ModStore queries take at most 8 names: tabulate a long list in chunks.
+local function dfTabulate(store, kind, cfg, names)
+	local out = {}
+	for i = 1, #names, 8 do
+		local chunk = {}
+		for j = i, math.min(i + 7, #names) do chunk[#chunk + 1] = names[j] end
+		for _, e in ipairs(store:Tabulate(kind, cfg, unpack(chunk))) do out[#out + 1] = e end
+	end
+	return out
+end
+
+local function dfPair(min, max)
+	min, max = tonumber(min) or 0, tonumber(max) or 0
+	return { min = min, max = max, avg = (min + max) / 2 }
+end
+
+local function dfAvg(v)
+	return { min = v, max = v, avg = v }
+end
+
+-- Skill-phase conversion only (stage 1 of CalcOffence's conversion table).
+local function dfSkillConversion(skillModList, skillCfg)
+	local tableOut = {}
+	for _, from in ipairs(DF_TYPES) do
+		local row, total = {}, 0
+		for _, to in ipairs(DF_TYPES) do
+			local conv = math.max(skillModList:Sum("BASE", skillCfg, "SkillDamageConvertTo" .. to, "Skill" .. from .. "DamageConvertTo" .. to), 0)
+			row[to] = conv / 100
+			total = total + conv
+		end
+		if total > 100 then
+			for to, v in pairs(row) do row[to] = v * 100 / total end
+			total = 100
+		end
+		row.mult = 1 - math.min(total / 100, 1)
+		tableOut[from] = row
+	end
+	return tableOut
+end
+
+local function dfConversionSources(skillModList, skillCfg, skill)
+	local names = {}
+	for _, from in ipairs(DF_TYPES) do
+		for _, to in ipairs(DF_TYPES) do
+			if skill then
+				names[#names + 1] = "SkillDamageConvertTo" .. to
+				names[#names + 1] = "Skill" .. from .. "DamageConvertTo" .. to
+			else
+				names[#names + 1] = "DamageConvertTo" .. to
+				names[#names + 1] = from .. "DamageConvertTo" .. to
+				names[#names + 1] = "ElementalDamageConvertTo" .. to
+				names[#names + 1] = "NonChaosDamageConvertTo" .. to
+			end
+		end
+	end
+	local seen, uniq = {}, {}
+	for _, n in ipairs(names) do if not seen[n] then seen[n] = true; uniq[#uniq + 1] = n end end
+	return dfSources(dfTabulate(skillModList, "BASE", skillCfg, uniq), "BASE")
+end
+
+local function dfGainSources(skillModList, skillCfg)
+	local names, seen = {}, {}
+	local function add(n) if n and not seen[n] then seen[n] = true; names[#names + 1] = n end end
+	for _, from in ipairs(DF_TYPES) do
+		for _, to in ipairs(DF_TYPES) do
+			add("DamageAs" .. to); add("DamageGainAs" .. to); add(from .. "DamageAs" .. to); add(from .. "DamageGainAs" .. to)
+			add("ElementalDamageAs" .. to); add("ElementalDamageGainAs" .. to); add("NonChaosDamageAs" .. to); add("NonChaosDamageGainAs" .. to)
+			add("SkillDamageGainAs" .. to); add("Skill" .. from .. "DamageGainAs" .. to); add("SkillElementalDamageGainAs" .. to); add("SkillNonChaosDamageGainAs" .. to)
+		end
+	end
+	return dfSources(dfTabulate(skillModList, "BASE", skillCfg, names), "BASE")
+end
+
+local function dfFlows(convTable, fromValues)
+	local flows = array({})
+	for _, from in ipairs(DF_TYPES) do
+		for _, to in ipairs(DF_TYPES) do
+			local pct = convTable[from] and convTable[from][to] or 0
+			if from ~= to and pct > 0 then
+				flows[#flows + 1] = { from = from, to = to, pct = pct * 100, amount = (fromValues[from] or 0) * pct }
+			end
+		end
+	end
+	return flows
+end
+
+local function dfDamageModNames(damageType)
+	local names = { "Damage", damageType .. "Damage" }
+	if DF_ELEMENTAL[damageType] then names[#names + 1] = "ElementalDamage" end
+	return names
+end
+
+local function dfWeaponDetail(slotName, weaponData)
+	local itemsTab = build.itemsTab
+	local slot = itemsTab and itemsTab.slots and itemsTab.slots[slotName]
+	local item = slot and itemsTab.items[slot.selItemId]
+	if not item or not item.base or not item.base.weapon then return null end
+	local base, final = {}, {}
+	for _, t in ipairs(DF_TYPES) do
+		base[t] = dfPair(item.base.weapon[t .. "Min"], item.base.weapon[t .. "Max"])
+		final[t] = dfPair(weaponData and weaponData[t .. "Min"], weaponData and weaponData[t .. "Max"])
+	end
+	local lines = array({})
+	for _, list in ipairs({ item.implicitModLines or {}, item.runeModLines or {}, item.explicitModLines or {} }) do
+		for _, ml in ipairs(list) do
+			local text = ml.line and tostring(ml.line)
+			if text and text:find("Damage") and not text:find(" to Attacks") and not text:find(" with ") and (text:find("^Adds ") or text:find("increased Physical Damage") or text:find("increased Elemental Damage") or text:find("increased %a+ Damage$")) then
+				lines[#lines + 1] = text
+			end
+		end
+	end
+	return {
+		name = item.name or item.base.name or slotName,
+		baseName = item.baseName or (item.base and item.base.name) or null,
+		quality = item.quality or 0,
+		base = base,
+		final = final,
+		localLines = lines,
+	}
+end
+
+local function dfSkillName(skill)
+	if gemUtil and gemUtil.skillDisplayName then
+		local ok, name = pcall(gemUtil.skillDisplayName, skill)
+		if ok and name then return name end
+	end
+	local ae = skill and skill.activeEffect
+	return ae and ae.grantedEffect and ae.grantedEffect.name or ""
+end
+
+M.damage_flow = function()
+	ensureBuild()
+	if not IS_POE2 then return { supported = false, reason = "poe1", rev = build.outputRevision } end
+	local env = build.calcsTab.calcsEnv or build.calcsTab.mainEnv
+	local actor = env and env.player
+	local skill = actor and actor.mainSkill
+	if not skill or not skill.skillModList or not skill.conversionTable then
+		return { supported = false, reason = "noskill", rev = build.outputRevision }
+	end
+	local skillModList, skillCfg = skill.skillModList, skill.skillCfg
+	local ae = skill.activeEffect or {}
+	local statSet = (env.mode == "CALCS" and ae.statSetCalcs) or ae.statSet or ae.statSetCalcs
+	local skillFlags = (statSet and statSet.skillFlags) or skill.skillFlags or {}
+	local globalOutput = actor.output or {}
+	local isAttack = skillFlags.attack and true or false
+
+	-- Pass to show: main hand (or the off hand alone) for attacks, the skill otherwise.
+	local passOutput, cfg, sourceData, weaponSlot, passLabel = globalOutput, skillCfg, skill.skillData or {}, nil, "Skill"
+	if isAttack then
+		if skillFlags.weapon1Attack and globalOutput.MainHand then
+			passOutput, cfg, sourceData, weaponSlot, passLabel = globalOutput.MainHand, skill.weapon1Cfg or skillCfg, actor.weaponData1 or {}, "Weapon 1", "Main Hand"
+		elseif skillFlags.weapon2Attack and globalOutput.OffHand then
+			passOutput, cfg, sourceData, weaponSlot, passLabel = globalOutput.OffHand, skill.weapon2Cfg or skillCfg, actor.weaponData2 or {}, "Weapon 2", "Off Hand"
+		end
+	end
+	if not skillFlags.hit then
+		return { supported = false, reason = "nohit", skill = dfSkillName(skill), rev = build.outputRevision }
+	end
+	local o = passOutput
+	local enemyDB = actor.enemy and actor.enemy.modDB
+	local critChance = (tonumber(o.CritChance) or 0) / 100
+	local critMultiplier = tonumber(o.CritMultiplier) or 1
+
+	local steps = array({})
+	local function addStep(step) steps[#steps + 1] = step end
+	local function avgTable(src) local t = {} for _, ty in ipairs(DF_TYPES) do t[ty] = src[ty].avg end return t end
+
+	-- 1. Weapon (or skill) base damage
+	local baseMultiplier = (skill.activeEffect and skill.activeEffect.grantedEffectLevel and skill.activeEffect.grantedEffectLevel.baseMultiplier) or (skill.skillData and skill.skillData.baseMultiplier) or 1
+	local sourceValues, added, addedMult = {}, {}, {}
+	for _, t in ipairs(DF_TYPES) do
+		sourceValues[t] = dfPair((sourceData[t .. "Min"] or 0) + (sourceData[t .. "BonusMin"] or 0), (sourceData[t .. "Max"] or 0) + (sourceData[t .. "BonusMax"] or 0))
+		added[t] = dfPair(skillModList:Sum("BASE", cfg, t .. "Min"), skillModList:Sum("BASE", cfg, t .. "Max"))
+		addedMult[t] = calcLib.mod(skillModList, cfg, "Added" .. t .. "Damage", "AddedDamage")
+	end
+	local weapon = weaponSlot and dfWeaponDetail(weaponSlot, sourceData) or null
+	addStep({
+		id = "source",
+		values = sourceValues,
+		weapon = weapon,
+	})
+
+	-- 2. Added damage, then the gem's Attack Damage / effectiveness
+	local baseValues, addedSources = {}, array({})
+	for _, t in ipairs(DF_TYPES) do
+		baseValues[t] = dfPair(o[t .. "MinBase"], o[t .. "MaxBase"])
+	end
+	local addedNames = {}
+	for _, t in ipairs(DF_TYPES) do addedNames[#addedNames + 1] = t .. "Min"; addedNames[#addedNames + 1] = t .. "Max" end
+	addedSources = dfSources(dfTabulate(skillModList, "BASE", cfg, addedNames), "BASE")
+	addStep({
+		id = "added",
+		values = baseValues,
+		added = added,
+		addedMult = addedMult,
+		baseMultiplier = baseMultiplier,
+		sources = addedSources,
+	})
+
+	-- 3a. Skill conversion
+	local base = avgTable(baseValues)
+	local phase1 = dfSkillConversion(skillModList, skillCfg)
+	local afterSkill = {}
+	for _, to in ipairs(DF_TYPES) do
+		local v = base[to] * phase1[to].mult
+		for _, from in ipairs(DF_TYPES) do v = v + base[from] * (phase1[from][to] or 0) end
+		afterSkill[to] = dfAvg(v)
+	end
+	addStep({
+		id = "convSkill",
+		values = afterSkill,
+		flows = dfFlows(phase1, base),
+		sources = dfConversionSources(skillModList, skillCfg, true),
+	})
+
+	-- 3b. Global conversion: the final table, applied to the base
+	local conv = skill.conversionTable
+	local afterConv, convertedIn = {}, {}
+	for _, to in ipairs(DF_TYPES) do
+		local converted = 0
+		for _, from in ipairs(DF_TYPES) do converted = converted + base[from] * (conv[from][to] or 0) end
+		convertedIn[to] = converted
+		afterConv[to] = dfAvg(base[to] * (conv[to].mult or 1) + converted)
+	end
+	-- Global flows: what moved in stage 2 = final table minus stage 1.
+	local stage2 = {}
+	for _, from in ipairs(DF_TYPES) do
+		stage2[from] = {}
+		for _, to in ipairs(DF_TYPES) do
+			stage2[from][to] = math.max((conv[from][to] or 0) - (phase1[from][to] or 0), 0)
+		end
+	end
+	local conversionTable = {}
+	for _, from in ipairs(DF_TYPES) do
+		local row = { kept = (conv[from].mult or 1) * 100 }
+		for _, to in ipairs(DF_TYPES) do row[to] = (conv[from][to] or 0) * 100 end
+		conversionTable[from] = row
+	end
+	addStep({
+		id = "convGlobal",
+		values = afterConv,
+		flows = dfFlows(stage2, base),
+		table = conversionTable,
+		sources = dfConversionSources(skillModList, skillCfg, false),
+	})
+
+	-- 3c. Gain as extra: PoB's summed base (unconverted + converted + gained)
+	local summed, gainFlows = {}, array({})
+	for _, t in ipairs(DF_TYPES) do summed[t] = dfPair(o[t .. "SummedMinBase"], o[t .. "SummedMaxBase"]) end
+	local gain = skill.gainTable or {}
+	for _, from in ipairs(DF_TYPES) do
+		for _, to in ipairs(DF_TYPES) do
+			local g = gain[from] and gain[from][to] or 0
+			if g > 0 and afterConv[from].avg > 0 then
+				gainFlows[#gainFlows + 1] = { from = from, to = to, pct = g * 100, amount = afterConv[from].avg * g }
+			end
+		end
+	end
+	addStep({
+		id = "gain",
+		values = summed,
+		flows = gainFlows,
+		sources = dfGainSources(skillModList, skillCfg),
+	})
+
+	-- 4a/4b. Increased and more, by final damage type only
+	local incValues, moreValues, incFactor, moreFactor, incSources, moreSources = {}, {}, {}, {}, {}, {}
+	for _, t in ipairs(DF_TYPES) do
+		local names = dfDamageModNames(t)
+		local inc = skillModList:Sum("INC", cfg, unpack(names))
+		local more = skillModList:More(cfg, unpack(names))
+		local moreMin = skillModList:More(cfg, "Min" .. t .. "Damage")
+		local moreMax = skillModList:More(cfg, "Max" .. t .. "Damage")
+		incFactor[t] = 1 + inc / 100
+		moreFactor[t] = more
+		incValues[t] = dfPair(summed[t].min * incFactor[t], summed[t].max * incFactor[t])
+		moreValues[t] = dfPair(summed[t].min * incFactor[t] * more * moreMin, summed[t].max * incFactor[t] * more * moreMax)
+		if summed[t].avg > 0 then
+			incSources[t] = dfSources(skillModList:Tabulate("INC", cfg, unpack(names)), "INC")
+			local moreList = {}
+			for _, e in ipairs(skillModList:Tabulate("MORE", cfg, unpack(names))) do moreList[#moreList + 1] = e end
+			for _, e in ipairs(skillModList:Tabulate("MORE", cfg, "Min" .. t .. "Damage", "Max" .. t .. "Damage")) do moreList[#moreList + 1] = e end
+			moreSources[t] = dfSources(moreList, "MORE")
+		else
+			incSources[t] = array({})
+			moreSources[t] = array({})
+		end
+	end
+	addStep({ id = "increased", values = incValues, factor = incFactor, sourcesByType = incSources })
+	addStep({ id = "more", values = moreValues, factor = moreFactor, sourcesByType = moreSources })
+
+	-- 4c. Other hit multipliers (double/triple damage, warcries, ...), already in StoredHit
+	local hitValues, allMult = {}, tonumber(o.allMult) or 1
+	for _, t in ipairs(DF_TYPES) do hitValues[t] = dfPair(o[t .. "StoredHitMin"], o[t .. "StoredHitMax"]) end
+	local doubleEffect = tonumber(o.DoubleDamageEffect) or 0
+	local tripleEffect = tonumber(o.TripleDamageEffect) or 0
+	if math.abs(allMult - 1) > 1e-6 or doubleEffect ~= 0 or tripleEffect ~= 0 then
+		addStep({
+			id = "other",
+			values = hitValues,
+			allMult = allMult,
+			doubleChance = tonumber(o.DoubleDamageChance) or 0,
+			tripleChance = tonumber(o.TripleDamageChance) or 0,
+		})
+	end
+
+	-- 5. Crits: the average of non-crit and crit hits, before mitigation
+	local combined = {}
+	for _, t in ipairs(DF_TYPES) do combined[t] = dfAvg(tonumber(o[t .. "StoredCombinedAvg"]) or 0) end
+	addStep({
+		id = "crit",
+		values = combined,
+		critChance = critChance * 100,
+		critMultiplier = critMultiplier,
+		critAvgMult = 1 + critChance * (critMultiplier - 1),
+	})
+
+	-- 6/7. Enemy: resistances or armour, then damage taken
+	local mitigated, taken, final, enemy = {}, {}, {}, {}
+	for _, t in ipairs(DF_TYPES) do
+		local hitAvg = tonumber(o[t .. "HitAverage"]) or 0
+		local critAvg = tonumber(o[t .. "CritAverage"]) or 0
+		local finalAvg = hitAvg * (1 - critChance) + critAvg * critChance
+		local takenInc, takenMore, takenIncSources, takenMoreSources = 0, 1, array({}), array({})
+		local info = { type = t }
+		if enemyDB then
+			local incNames = { "DamageTaken", t .. "DamageTaken" }
+			if DF_ELEMENTAL[t] then incNames[#incNames + 1] = "ElementalDamageTaken" end
+			takenInc = enemyDB:Sum("INC", cfg, unpack(incNames))
+			local incList = enemyDB:Tabulate("INC", cfg, unpack(incNames))
+			if skillFlags.projectile then
+				takenInc = takenInc + enemyDB:Sum("INC", nil, "ProjectileDamageTaken")
+				for _, e in ipairs(enemyDB:Tabulate("INC", nil, "ProjectileDamageTaken")) do incList[#incList + 1] = e end
+				if isAttack then
+					takenInc = takenInc + enemyDB:Sum("INC", nil, "ProjectileAttackDamageTaken")
+					for _, e in ipairs(enemyDB:Tabulate("INC", nil, "ProjectileAttackDamageTaken")) do incList[#incList + 1] = e end
+				end
+			end
+			takenMore = enemyDB:More(cfg, "DamageTaken", t .. "DamageTaken")
+			takenIncSources = dfSources(incList, "INC")
+			takenMoreSources = dfSources(enemyDB:Tabulate("MORE", cfg, "DamageTaken", t .. "DamageTaken"), "MORE")
+			if t == "Physical" then
+				local armour = enemyDB:Override(nil, "Armour") or calcLib.val(enemyDB, "Armour")
+				info.armour = armour
+				info.physicalReduction = enemyDB:Sum("BASE", nil, "PhysicalDamageReduction")
+			else
+				local resistNames = { t .. "Resist" }
+				if DF_ELEMENTAL[t] then resistNames[#resistNames + 1] = "ElementalResist" end
+				info.resistOverride = opt(enemyDB:Override(cfg, t .. "Resist"))
+				info.resist = enemyDB:Sum("BASE", cfg, unpack(resistNames))
+				info.resistSources = dfSources(enemyDB:Tabulate("BASE", cfg, unpack(resistNames)), "BASE")
+				if DF_ELEMENTAL[t] then
+					info.penetration = skillModList:Sum("BASE", cfg, t .. "Penetration", "ElementalPenetration")
+					info.penetrationSources = dfSources(skillModList:Tabulate("BASE", cfg, t .. "Penetration", "ElementalPenetration"), "BASE")
+				elseif t == "Chaos" then
+					info.penetration = skillModList:Sum("BASE", cfg, "ChaosPenetration")
+					info.penetrationSources = dfSources(skillModList:Tabulate("BASE", cfg, "ChaosPenetration"), "BASE")
+				end
+			end
+		end
+		local takenMult = (1 + takenInc / 100) * takenMore
+		local pre = combined[t].avg
+		local mitigationMult = (pre > 0 and takenMult > 0) and finalAvg / (pre * takenMult) or 1
+		info.mitigationMult = mitigationMult
+		info.effectiveResist = (1 - mitigationMult) * 100
+		info.takenInc = takenInc
+		info.takenMore = takenMore
+		info.takenMult = takenMult
+		info.takenIncSources = takenIncSources
+		info.takenMoreSources = takenMoreSources
+		info.effMult = tonumber(o[t .. "EffMult"]) or null
+		enemy[t] = info
+		mitigated[t] = dfAvg(pre * mitigationMult)
+		taken[t] = dfAvg(finalAvg)
+		final[t] = finalAvg
+	end
+	addStep({ id = "mitigation", values = mitigated, enemy = enemy })
+	addStep({ id = "taken", values = taken })
+
+	local total = 0
+	for _, t in ipairs(DF_TYPES) do total = total + final[t] end
+	return {
+		supported = true,
+		rev = build.outputRevision,
+		skill = dfSkillName(skill),
+		isAttack = isAttack,
+		pass = passLabel,
+		types = array({ "Physical", "Lightning", "Cold", "Fire", "Chaos" }),
+		steps = steps,
+		averageHit = total,
+		pobAverageHit = tonumber(o.AverageHit) or null,
+		hitChance = tonumber(o.HitChance) or null,
+		averageDamage = tonumber(o.AverageDamage) or null,
+		critChance = critChance * 100,
+		critMultiplier = critMultiplier,
+	}
+end
+
 -- Which config options PoB would show for the current build (each control's
 -- `shown` closure evaluates ifSkill/ifFlag/ifCond/... against the live env).
 M.config_visibility = function()
